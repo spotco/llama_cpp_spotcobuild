@@ -20,12 +20,15 @@
 #include <algorithm>
 #include <cstddef>
 #include <cinttypes>
+#include <cstdio>
 #include <exception>
 #include <memory>
 #include <filesystem>
 #include <random>
 #include <utility>
 #include <fstream>
+#include <cstdlib>
+#include <mutex>
 
 // fix problem with std::min and std::max
 #if defined(_WIN32)
@@ -37,6 +40,20 @@
 #endif
 
 constexpr int HTTP_POLLING_SECONDS = 1;
+
+// Optional human-readable token tracing for local development.  This is kept
+// independent of the normal server logger so every decoded token piece can be
+// flushed immediately to an attached console.
+static bool server_trace_tokens_enabled() {
+    static const bool enabled = [] {
+        const char * value = std::getenv("LLAMA_TRACE_TOKENS");
+        return value != nullptr && value[0] != '\0' && !(value[0] == '0' && value[1] == '\0');
+    }();
+
+    return enabled;
+}
+
+static std::mutex server_trace_mutex;
 
 static common_speculative_output_limits server_output_limits(const common_params & params) {
     if (params.embedding ||
@@ -287,6 +304,8 @@ struct server_slot {
     bool has_new_line   = false;
     bool truncated      = false;
 
+    bool trace_active = false;
+
     stop_type stop;
 
     std::string stopping_word;
@@ -366,6 +385,48 @@ struct server_slot {
     int64_t t_print_last = 0;
     int32_t n_gen_last = 0;
 
+    void trace_start() {
+        if (!server_trace_tokens_enabled() || trace_active || !task || !task->need_sampling()) {
+            return;
+        }
+
+        const std::string prompt = task->tokens.detokenize(ctx_tgt, true);
+
+        std::lock_guard<std::mutex> lock(server_trace_mutex);
+        std::fputs("\xE2\x94\x80\xE2\x94\x80\xE2\x94\x80\xE2\x94\x80 INPUT \xE2\x94\x80\xE2\x94\x80\xE2\x94\x80\xE2\x94\x80\n", stderr);
+        if (!prompt.empty()) {
+            std::fwrite(prompt.data(), 1, prompt.size(), stderr);
+        }
+        if (prompt.empty() || prompt.back() != '\n') {
+            std::fputc('\n', stderr);
+        }
+        std::fputs("\xE2\x94\x80\xE2\x94\x80\xE2\x94\x80\xE2\x94\x80 OUTPUT \xE2\x94\x80\xE2\x94\x80\xE2\x94\x80\xE2\x94\x80\n", stderr);
+        std::fflush(stderr);
+
+        trace_active = true;
+    }
+
+    void trace_token(const std::string & piece) {
+        if (!trace_active || piece.empty()) {
+            return;
+        }
+
+        std::lock_guard<std::mutex> lock(server_trace_mutex);
+        std::fwrite(piece.data(), 1, piece.size(), stderr);
+        std::fflush(stderr);
+    }
+
+    void trace_finish() {
+        if (!trace_active) {
+            return;
+        }
+
+        std::lock_guard<std::mutex> lock(server_trace_mutex);
+        std::fputc('\n', stderr);
+        std::fflush(stderr);
+        trace_active = false;
+    }
+
     void reset() {
         SLT_DBG(*this, "%s", "\n");
 
@@ -390,6 +451,7 @@ struct server_slot {
 
         task_prev = std::move(task);
         task.reset();
+        trace_active = false;
 
         // note: callback_on_reset() must have run before this, see release()
         stats = {};
@@ -544,6 +606,8 @@ struct server_slot {
     void release() {
         if (is_processing()) {
             GGML_ASSERT(task);
+
+            trace_finish();
 
             SLT_INF(*this, "stop processing: n_tokens = %d, truncated = %d\n", prompt.n_tokens(), truncated);
 
@@ -1823,6 +1887,8 @@ private:
             ? SLOT_STATE_WAIT_OTHER // wait for the parent to process prompt
             : SLOT_STATE_STARTED;
 
+        slot.trace_start();
+
         // reset server kill-switch counter
         n_empty_consecutive = 0;
 
@@ -1833,6 +1899,7 @@ private:
     bool process_token(completion_token_output & result, server_slot & slot) {
         // remember which tokens were sampled - used for repetition penalties during sampling
         const std::string token_str = result.text_to_send;
+        slot.trace_token(token_str);
         slot.sampled = result.tok;
 
         slot.generated_text += token_str;
