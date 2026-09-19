@@ -1125,6 +1125,7 @@ private:
         std::string stage;
         std::vector<std::string> stages;
         int64_t t_last_load_progress_ms = 0;
+        int last_text_model_percentage = -1;
         load_progress_data(server_context_impl * ctx, const std::string & stage) : ctx(ctx), stage(stage) {}
     };
     static bool load_progress_callback(float progress, void * user_data) {
@@ -1142,6 +1143,22 @@ private:
             }
             t_last = t_now;
         }
+
+        // llama-server supplies this callback to the model loader, so the
+        // default callback in src/llama.cpp is not used here. Keep the
+        // human-readable progress visible at generic output level so it is
+        // shown even with the launcher's normal --verbosity 2 setting.
+        if (d->stage == "text_model") {
+            const int percentage = std::min(100, std::max(0, (int) (100.0f * progress)));
+            if (percentage != d->last_text_model_percentage) {
+                d->last_text_model_percentage = percentage;
+                LOG("\rloading model: %3d%%", percentage);
+                if (percentage >= 100) {
+                    LOG("\n");
+                }
+            }
+        }
+
         if (d->ctx->callback_state) {
             d->ctx->callback_state(SERVER_STATE_LOADING, {
                 {"stages", d->stages},

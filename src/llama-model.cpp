@@ -1860,7 +1860,10 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         memory_residency(host_bytes, device_bytes);
         const double total_bytes = (double) host_bytes + (double) device_bytes;
         if (total_bytes > 0.0) {
-            LLAMA_LOG_INFO("%s: model buffer residency = %.1f%% device / %.1f%% host (%.2f MiB / %.2f MiB)\n",
+            // Keep this diagnostic visible with the launcher's normal
+            // --verbosity 2 setting. It is a deliberate startup summary,
+            // not per-token logging.
+            LLAMA_LOG("%s: model buffer residency = %.1f%% device / %.1f%% host (%.2f MiB / %.2f MiB)\n",
                     __func__,
                     100.0 * device_bytes / total_bytes,
                     100.0 * host_bytes / total_bytes,
