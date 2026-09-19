@@ -22,7 +22,7 @@ enables output-token logging; `--no-log-output-tps` or
 <the rendered, detokenized request prompt>
 ──── OUTPUT ────
 <each generated token piece>
-[output tokens/sec: 37.41 | generated tokens: 32]
+[output tokens/sec: 37.41 | generated tokens: 32 | model buffers: 73.8% device / 26.2% host]
 ──── END OUTPUT ────
 ```
 
@@ -32,7 +32,13 @@ written from the server token-processing path before stop-string filtering,
 which keeps the trace aligned with generation rather than with an HTTP/SSE
 chunk boundary. The speed value uses the same generation timing calculation as
 llama.cpp's normal timing report (`n_gen_tps()`), including its existing
-exclusion of the initial prompt-logits step.
+exclusion of the initial prompt-logits step. The TPS line also reports the
+allocated model-weight buffer split between non-host/device memory and
+host-accessible memory. On a discrete CUDA GPU, these correspond to VRAM and
+system RAM respectively.
+
+The default llama.cpp model loader also reports byte-based loading progress as
+`loading model: NN%` instead of printing one dot per percentage point.
 
 Trace output is sent through a background sink, so terminal writes and flushes
 are not performed synchronously by the decode thread. With tracing disabled,

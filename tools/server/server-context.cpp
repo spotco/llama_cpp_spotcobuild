@@ -490,9 +490,22 @@ struct server_slot {
         std::string trace = "\n";
         if (trace_output_tokens) {
             if (trace_output_tps) {
-                trace += string_format(
-                    "[output tokens/sec: %.2f | generated tokens: %llu]\n",
-                    stats.n_gen_tps(), (unsigned long long) stats.n_gen);
+                uint64_t host_bytes = 0;
+                uint64_t device_bytes = 0;
+                llama_model_memory_residency(llama_get_model(ctx_tgt), &host_bytes, &device_bytes);
+                const double total_bytes = (double) host_bytes + (double) device_bytes;
+
+                if (total_bytes > 0.0) {
+                    trace += string_format(
+                        "[output tokens/sec: %.2f | generated tokens: %llu | model buffers: %.1f%% device / %.1f%% host]\n",
+                        stats.n_gen_tps(), (unsigned long long) stats.n_gen,
+                        100.0 * device_bytes / total_bytes,
+                        100.0 * host_bytes / total_bytes);
+                } else {
+                    trace += string_format(
+                        "[output tokens/sec: %.2f | generated tokens: %llu]\n",
+                        stats.n_gen_tps(), (unsigned long long) stats.n_gen);
+                }
             }
             trace += "\xE2\x94\x80\xE2\x94\x80\xE2\x94\x80\xE2\x94\x80 END OUTPUT \xE2\x94\x80\xE2\x94\x80\xE2\x94\x80\xE2\x94\x80\n";
             server_trace_output().enqueue(std::move(trace));
