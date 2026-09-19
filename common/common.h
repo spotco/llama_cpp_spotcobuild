@@ -517,6 +517,7 @@ struct common_params {
     std::string path_prompts_log_dir = ""; // directory with logged prompts                                 // NOLINT
     bool log_input_tokens            = false; // server: log the rendered input token stream
     bool log_output_tokens           = false; // server: log generated output token pieces
+    bool log_output_tps              = false; // server: append generation tokens/sec at output end
     bool log_tokens_options_set      = false; // server: explicit token logging option was supplied
 
     // llama-debug specific options

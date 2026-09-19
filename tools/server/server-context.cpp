@@ -21,10 +21,14 @@
 #include <cstddef>
 #include <cinttypes>
 #include <cstdio>
+#include <condition_variable>
+#include <deque>
 #include <exception>
+#include <future>
 #include <memory>
 #include <filesystem>
 #include <random>
+#include <thread>
 #include <utility>
 #include <fstream>
 #include <cstdlib>
@@ -49,7 +53,69 @@ static bool server_trace_tokens_env_enabled() {
     return value != nullptr && value[0] != '\0' && !(value[0] == '0' && value[1] == '\0');
 }
 
-static std::mutex server_trace_mutex;
+struct server_trace_event {
+    std::string text;
+    std::shared_ptr<std::promise<void>> barrier;
+};
+
+// Keep terminal/file I/O off the decode thread. The queue still preserves
+// token order and the worker flushes each event for real-time display.
+struct server_trace_sink {
+    server_trace_sink() : worker([this] { run(); }) {}
+
+    void enqueue(std::string text) {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            events.push_back({std::move(text), nullptr});
+        }
+        condition.notify_one();
+    }
+
+    void flush() {
+        auto barrier = std::make_shared<std::promise<void>>();
+        auto future = barrier->get_future();
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            events.push_back({{}, std::move(barrier)});
+        }
+        condition.notify_one();
+        future.wait();
+    }
+
+private:
+    std::mutex mutex;
+    std::condition_variable condition;
+    std::deque<server_trace_event> events;
+    std::thread worker;
+
+    void run() {
+        while (true) {
+            server_trace_event event;
+            {
+                std::unique_lock<std::mutex> lock(mutex);
+                condition.wait(lock, [this] { return !events.empty(); });
+                event = std::move(events.front());
+                events.pop_front();
+            }
+
+            if (!event.text.empty()) {
+                std::fwrite(event.text.data(), 1, event.text.size(), stderr);
+                std::fflush(stderr);
+            }
+            if (event.barrier) {
+                std::fflush(stderr);
+                event.barrier->set_value();
+            }
+        }
+    }
+};
+
+static server_trace_sink & server_trace_output() {
+    // Intentionally leaked: the server's logging thread must not be torn down
+    // during Windows process shutdown after the logger has already stopped.
+    static auto * sink = new server_trace_sink();
+    return *sink;
+}
 
 static common_speculative_output_limits server_output_limits(const common_params & params) {
     if (params.embedding ||
@@ -302,6 +368,7 @@ struct server_slot {
 
     bool trace_input_tokens  = false;
     bool trace_output_tokens = false;
+    bool trace_output_tps    = false;
     bool trace_active         = false;
 
     stop_type stop;
@@ -390,20 +457,19 @@ struct server_slot {
 
         const std::string prompt = task->tokens.detokenize(ctx_tgt, true);
 
-        std::lock_guard<std::mutex> lock(server_trace_mutex);
+        std::string trace;
         if (trace_input_tokens) {
-            std::fputs("\xE2\x94\x80\xE2\x94\x80\xE2\x94\x80\xE2\x94\x80 INPUT \xE2\x94\x80\xE2\x94\x80\xE2\x94\x80\xE2\x94\x80\n", stderr);
-            if (!prompt.empty()) {
-                std::fwrite(prompt.data(), 1, prompt.size(), stderr);
-            }
+            trace += "\xE2\x94\x80\xE2\x94\x80\xE2\x94\x80\xE2\x94\x80 INPUT \xE2\x94\x80\xE2\x94\x80\xE2\x94\x80\xE2\x94\x80\n";
+            trace += prompt;
             if (prompt.empty() || prompt.back() != '\n') {
-                std::fputc('\n', stderr);
+                trace += '\n';
             }
         }
         if (trace_output_tokens) {
-            std::fputs("\xE2\x94\x80\xE2\x94\x80\xE2\x94\x80\xE2\x94\x80 OUTPUT \xE2\x94\x80\xE2\x94\x80\xE2\x94\x80\xE2\x94\x80\n", stderr);
+            trace += "\xE2\x94\x80\xE2\x94\x80\xE2\x94\x80\xE2\x94\x80 OUTPUT \xE2\x94\x80\xE2\x94\x80\xE2\x94\x80\xE2\x94\x80\n";
         }
-        std::fflush(stderr);
+        server_trace_output().enqueue(std::move(trace));
+        server_trace_output().flush();
 
         trace_active = true;
     }
@@ -413,9 +479,7 @@ struct server_slot {
             return;
         }
 
-        std::lock_guard<std::mutex> lock(server_trace_mutex);
-        std::fwrite(piece.data(), 1, piece.size(), stderr);
-        std::fflush(stderr);
+        server_trace_output().enqueue(piece);
     }
 
     void trace_finish() {
@@ -423,11 +487,17 @@ struct server_slot {
             return;
         }
 
-        std::lock_guard<std::mutex> lock(server_trace_mutex);
+        std::string trace = "\n";
         if (trace_output_tokens) {
-            std::fputc('\n', stderr);
+            if (trace_output_tps) {
+                trace += string_format(
+                    "[output tokens/sec: %.2f | generated tokens: %llu]\n",
+                    stats.n_gen_tps(), (unsigned long long) stats.n_gen);
+            }
+            trace += "\xE2\x94\x80\xE2\x94\x80\xE2\x94\x80\xE2\x94\x80 END OUTPUT \xE2\x94\x80\xE2\x94\x80\xE2\x94\x80\xE2\x94\x80\n";
+            server_trace_output().enqueue(std::move(trace));
+            server_trace_output().flush();
         }
-        std::fflush(stderr);
         trace_active = false;
     }
 
@@ -1372,6 +1442,7 @@ private:
 
             slot.trace_input_tokens  = params_base.log_input_tokens;
             slot.trace_output_tokens = params_base.log_output_tokens;
+            slot.trace_output_tps    = params_base.log_output_tps;
 
             slot.mctx                   = mctx;
             slot.prompt.tokens.has_mtmd = mctx != nullptr;

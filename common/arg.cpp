@@ -3909,6 +3909,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_LOG_OUTPUT_TOKENS"));
     add_opt(common_arg(
+        {"--log-output-tps"},
+        {"--no-log-output-tps"},
+        "Append calculated output tokens/sec before the output trace ends (server)",
+        [](common_params & params, bool value) {
+            params.log_output_tps = value;
+            if (value) {
+                params.log_output_tokens = true;
+            }
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_LOG_OUTPUT_TPS"));
+    add_opt(common_arg(
         {"--log-tokens", "--trace-tokens"},
         {"--no-log-tokens", "--no-trace-tokens"},
         "Enable or disable both input and output token logging (server)",
