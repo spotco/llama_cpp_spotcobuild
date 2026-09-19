@@ -3891,6 +3891,34 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
+        {"--log-input-tokens"},
+        {"--no-log-input-tokens"},
+        "Log the rendered input prompt and its special tokens to stderr (server)",
+        [](common_params & params, bool value) {
+            params.log_input_tokens = value;
+            params.log_tokens_options_set = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_LOG_INPUT_TOKENS"));
+    add_opt(common_arg(
+        {"--log-output-tokens"},
+        {"--no-log-output-tokens"},
+        "Log generated output token pieces to stderr as they are produced (server)",
+        [](common_params & params, bool value) {
+            params.log_output_tokens = value;
+            params.log_tokens_options_set = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_LOG_OUTPUT_TOKENS"));
+    add_opt(common_arg(
+        {"--log-tokens", "--trace-tokens"},
+        {"--no-log-tokens", "--no-trace-tokens"},
+        "Enable or disable both input and output token logging (server)",
+        [](common_params & params, bool value) {
+            params.log_input_tokens  = value;
+            params.log_output_tokens = value;
+            params.log_tokens_options_set = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_LOG_TOKENS"));
+    add_opt(common_arg(
         {"--log-colors"}, "[on|off|auto]",
         "Set colored logging ('on', 'off', or 'auto', default: 'auto')\n"
         "'auto' enables colors when output is to a terminal",

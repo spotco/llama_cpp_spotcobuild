@@ -44,13 +44,9 @@ constexpr int HTTP_POLLING_SECONDS = 1;
 // Optional human-readable token tracing for local development.  This is kept
 // independent of the normal server logger so every decoded token piece can be
 // flushed immediately to an attached console.
-static bool server_trace_tokens_enabled() {
-    static const bool enabled = [] {
-        const char * value = std::getenv("LLAMA_TRACE_TOKENS");
-        return value != nullptr && value[0] != '\0' && !(value[0] == '0' && value[1] == '\0');
-    }();
-
-    return enabled;
+static bool server_trace_tokens_env_enabled() {
+    const char * value = std::getenv("LLAMA_TRACE_TOKENS");
+    return value != nullptr && value[0] != '\0' && !(value[0] == '0' && value[1] == '\0');
 }
 
 static std::mutex server_trace_mutex;
@@ -304,7 +300,9 @@ struct server_slot {
     bool has_new_line   = false;
     bool truncated      = false;
 
-    bool trace_active = false;
+    bool trace_input_tokens  = false;
+    bool trace_output_tokens = false;
+    bool trace_active         = false;
 
     stop_type stop;
 
@@ -386,28 +384,32 @@ struct server_slot {
     int32_t n_gen_last = 0;
 
     void trace_start() {
-        if (!server_trace_tokens_enabled() || trace_active || !task || !task->need_sampling()) {
+        if ((!trace_input_tokens && !trace_output_tokens) || trace_active || !task || !task->need_sampling()) {
             return;
         }
 
         const std::string prompt = task->tokens.detokenize(ctx_tgt, true);
 
         std::lock_guard<std::mutex> lock(server_trace_mutex);
-        std::fputs("\xE2\x94\x80\xE2\x94\x80\xE2\x94\x80\xE2\x94\x80 INPUT \xE2\x94\x80\xE2\x94\x80\xE2\x94\x80\xE2\x94\x80\n", stderr);
-        if (!prompt.empty()) {
-            std::fwrite(prompt.data(), 1, prompt.size(), stderr);
+        if (trace_input_tokens) {
+            std::fputs("\xE2\x94\x80\xE2\x94\x80\xE2\x94\x80\xE2\x94\x80 INPUT \xE2\x94\x80\xE2\x94\x80\xE2\x94\x80\xE2\x94\x80\n", stderr);
+            if (!prompt.empty()) {
+                std::fwrite(prompt.data(), 1, prompt.size(), stderr);
+            }
+            if (prompt.empty() || prompt.back() != '\n') {
+                std::fputc('\n', stderr);
+            }
         }
-        if (prompt.empty() || prompt.back() != '\n') {
-            std::fputc('\n', stderr);
+        if (trace_output_tokens) {
+            std::fputs("\xE2\x94\x80\xE2\x94\x80\xE2\x94\x80\xE2\x94\x80 OUTPUT \xE2\x94\x80\xE2\x94\x80\xE2\x94\x80\xE2\x94\x80\n", stderr);
         }
-        std::fputs("\xE2\x94\x80\xE2\x94\x80\xE2\x94\x80\xE2\x94\x80 OUTPUT \xE2\x94\x80\xE2\x94\x80\xE2\x94\x80\xE2\x94\x80\n", stderr);
         std::fflush(stderr);
 
         trace_active = true;
     }
 
     void trace_token(const std::string & piece) {
-        if (!trace_active || piece.empty()) {
+        if (!trace_active || !trace_output_tokens || piece.empty()) {
             return;
         }
 
@@ -422,7 +424,9 @@ struct server_slot {
         }
 
         std::lock_guard<std::mutex> lock(server_trace_mutex);
-        std::fputc('\n', stderr);
+        if (trace_output_tokens) {
+            std::fputc('\n', stderr);
+        }
         std::fflush(stderr);
         trace_active = false;
     }
@@ -1075,6 +1079,14 @@ private:
         const bool is_resume = sleeping;
 
         params_base = params;
+
+        // Backward compatibility for the original development-only switch.
+        // New callers should use the explicit --log-* options below.
+        if (server_trace_tokens_env_enabled() && !params_base.log_tokens_options_set) {
+            params_base.log_input_tokens  = true;
+            params_base.log_output_tokens = true;
+        }
+
         const auto output_limits = server_output_limits(params_base);
         params_base.n_outputs_max = output_limits.total;
         params_base.n_outputs_max_per_seq = output_limits.per_seq;
@@ -1357,6 +1369,9 @@ private:
             slot.mem.init(ctx_tgt, ctx_dft);
             slot.spec    = spec.get();
             slot.n_ctx   = n_ctx_slot();
+
+            slot.trace_input_tokens  = params_base.log_input_tokens;
+            slot.trace_output_tokens = params_base.log_output_tokens;
 
             slot.mctx                   = mctx;
             slot.prompt.tokens.has_mtmd = mctx != nullptr;
