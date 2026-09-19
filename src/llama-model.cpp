@@ -1854,6 +1854,21 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
+    {
+        size_t host_bytes = 0;
+        size_t device_bytes = 0;
+        memory_residency(host_bytes, device_bytes);
+        const double total_bytes = (double) host_bytes + (double) device_bytes;
+        if (total_bytes > 0.0) {
+            LLAMA_LOG_INFO("%s: model buffer residency = %.1f%% device / %.1f%% host (%.2f MiB / %.2f MiB)\n",
+                    __func__,
+                    100.0 * device_bytes / total_bytes,
+                    100.0 * host_bytes / total_bytes,
+                    device_bytes / 1024.0 / 1024.0,
+                    host_bytes / 1024.0 / 1024.0);
+        }
+    }
+
     if (ml.no_alloc) {
         return true;
     }
@@ -1947,6 +1962,26 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_model::memory_breakdown() con
         }
     }
     return ret;
+}
+
+void llama_model::memory_residency(size_t & host_bytes, size_t & device_bytes) const {
+    host_bytes = 0;
+    device_bytes = 0;
+
+    if (hparams.no_alloc) {
+        return;
+    }
+
+    for (const auto & [_, bufs] : pimpl->ctxs_bufs) {
+        for (const auto & buf : bufs) {
+            const size_t size = ggml_backend_buffer_get_size(buf.get());
+            if (ggml_backend_buffer_is_host(buf.get())) {
+                host_bytes += size;
+            } else {
+                device_bytes += size;
+            }
+        }
+    }
 }
 
 uint64_t llama_model::n_elements() const {
@@ -3156,6 +3191,20 @@ llama_ftype llama_model_ftype(const llama_model * model) {
 
 uint64_t llama_model_size(const llama_model * model) {
     return model->size();
+}
+
+void llama_model_memory_residency(const llama_model * model, uint64_t * host_bytes, uint64_t * device_bytes) {
+    size_t host = 0;
+    size_t device = 0;
+    if (model != nullptr) {
+        model->memory_residency(host, device);
+    }
+    if (host_bytes != nullptr) {
+        *host_bytes = host;
+    }
+    if (device_bytes != nullptr) {
+        *device_bytes = device;
+    }
 }
 
 const char * llama_model_chat_template(const llama_model * model, const char * name) {

@@ -641,6 +641,13 @@ extern "C" {
     // Returns the total size of all the tensors in the model in bytes
     LLAMA_API uint64_t llama_model_size(const struct llama_model * model);
 
+    // Returns allocated model-buffer bytes split between host-accessible memory
+    // and device-local/non-host memory. Either output pointer may be NULL.
+    LLAMA_API void llama_model_memory_residency(
+            const struct llama_model * model,
+                         uint64_t * host_bytes,
+                         uint64_t * device_bytes);
+
     // Get the default chat template. Returns nullptr if not available
     // If name is NULL, returns the default chat template
     LLAMA_API const char * llama_model_chat_template(const struct llama_model * model, const char * name);
