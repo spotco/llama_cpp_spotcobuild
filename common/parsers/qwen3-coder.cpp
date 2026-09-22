@@ -88,9 +88,24 @@ common_chat_params common_chat_params_init_qwen3_coder(const common_chat_templat
 
         // Tool call parser
         if (has_tools && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE) {
-            auto arg_close  = p.tool_arg_close(p.literal("\n</parameter>\n"));
+            // Qwen3-Coder and the related templates render newlines around
+            // the XML tags. MiMo-V2.6 uses the same tags, but may emit them
+            // tightly (and can mix the two forms). Keep the newline as part
+            // of the delimiter when it is present so that a value's trailing
+            // newline is preserved, while also accepting the tight form.
+            // Most importantly, stop at the first parameter close instead of
+            // letting a later <tool_call> become part of the current string
+            // argument.
+            const std::vector<std::string> arg_delimiters = {
+                "\n</parameter>",
+                "</parameter>",
+            };
+            auto arg_end    = p.choice({ p.literal("\n</parameter>"), p.literal("</parameter>") });
+            auto arg_close  = p.tool_arg_close(arg_end);
+            auto arg_tail   = arg_close + p.optional(p.literal("\n"));
             auto arg_string = p.rule("xml-arg-string",
-                p.ac(p.tool_arg_string_value(p.until("\n</parameter>\n")) + arg_close, "\n</parameter>\n"));
+                p.ac(p.tool_arg_string_value(p.until_one_of(arg_delimiters)) + arg_close, arg_delimiters) +
+                p.optional(p.literal("\n")));
 
             auto tool_choice = p.choice();
             foreach_function(inputs.tools, [&](const json & tool) {
@@ -103,13 +118,14 @@ common_chat_params common_chat_params_init_qwen3_coder(const common_chat_templat
                 foreach_parameter(function, [&](const common_chat_schema_property & param, const common_chat_schema_document_ptr & doc) {
                     auto rule_name = "tool-" + name + "-arg-" + param.name;
 
-                    auto arg_open = p.tool_arg_open("<parameter=" + p.tool_arg_name(p.literal(param.name)) + ">\n");
+                    auto arg_open = p.tool_arg_open("<parameter=" + p.tool_arg_name(p.literal(param.name)) + ">" +
+                                                     p.optional(p.literal("\n")));
 
                     auto types = param.schema->value_types();
 
                     auto arg_value = p.eps();
                     if (!types.has(common_chat_schema::TYPE_STRING)) {
-                        arg_value = p.tool_arg_json_value(p.schema(p.json(), rule_name + "-schema", doc, *param.schema)) + arg_close;
+                        arg_value = p.tool_arg_json_value(p.schema(p.json(), rule_name + "-schema", doc, *param.schema)) + arg_tail;
                     } else if (types.is_only(common_chat_schema::TYPE_STRING)) {
                         arg_value = arg_string;
                     } else {
@@ -131,7 +147,7 @@ common_chat_params common_chat_params_init_qwen3_coder(const common_chat_templat
                         if (types.has(common_chat_schema::TYPE_NULL)) {
                             json_value |= p.json_null();
                         }
-                        arg_value = p.gbnf(p.atomic(p.tool_arg_json_value(json_value) + arg_close) | arg_string, "xml-arg-string");
+                        arg_value = p.gbnf(p.atomic(p.tool_arg_json_value(json_value) + arg_tail) | arg_string, "xml-arg-string");
                     }
 
                     auto arg_rule = p.rule(rule_name, p.tool_arg(arg_open + arg_value));
@@ -146,21 +162,23 @@ common_chat_params common_chat_params_init_qwen3_coder(const common_chat_templat
                     args = args + p.zero_or_more(p.choice(optional_args));
                 }
 
-                auto func = p.tool(p.tool_open("<function=" + p.tool_name(p.literal(name)) + ">\n") +
+                auto func = p.tool(p.tool_open("<function=" + p.tool_name(p.literal(name)) + ">" +
+                                              p.optional(p.literal("\n"))) +
                                    p.tool_args(args) +
-                                   p.tool_close(p.literal("</function>\n")));
+                                   p.tool_close(p.literal("</function>") + p.optional(p.literal("\n"))));
 
                 tool_choice |= p.rule("tool-" + name, func);
             });
 
             auto min_calls = inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED ? 1 : 0;
 
-            auto tool_call_body = tool_choice + "</tool_call>" + p.space();
-            auto tool_call      = p.rule("tool-call", "<tool_call>\n" + tool_call_body);
+            auto tool_call_start = p.literal("<tool_call>") + p.optional(p.literal("\n"));
+            auto tool_call_body  = tool_choice + "</tool_call>" + p.space();
+            auto tool_call        = p.rule("tool-call", tool_call_start + tool_call_body);
 
             // Qwen3-Coder models may occasionally omit the <tool_call> token.
             auto tool_call_first = is_qwen3_coder ?
-                p.rule("tool-call-first", p.optional(p.literal("<tool_call>\n")) + tool_call_body) :
+                p.rule("tool-call-first", p.optional(tool_call_start) + tool_call_body) :
                 tool_call;
 
             auto calls      = inputs.parallel_tool_calls ? tool_call_first + p.zero_or_more(tool_call) : tool_call_first;

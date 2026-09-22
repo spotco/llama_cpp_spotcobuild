@@ -1647,6 +1647,26 @@ static void test_msgs_oaicompat_json_conversion() {
                               "]"),
                   common_chat_msgs_to_json_oaicompat({ message_assist_call_python }).dump(2));
 
+    // MiMo emits multiple tight XML calls; the parsed message must serialize
+    // them as independent OpenAI tool_calls entries while keeping reasoning
+    // separate from ordinary content.
+    common_chat_msg mimo_parallel;
+    mimo_parallel.role = "assistant";
+    mimo_parallel.reasoning_content = "MiMo plan";
+    mimo_parallel.tool_calls = {
+        { "python", R"({"code":"Get-Content 'hello.txt' -Raw"})", "" },
+        { "edit",   R"({"filename":"hello.txt","oldString":"old","newString":"new"})", "" },
+    };
+    auto mimo_oai = common_chat_msgs_to_json_oaicompat({ mimo_parallel });
+    assert_equals<std::string>("", mimo_oai.at(0).at("content"));
+    assert_equals<std::string>("MiMo plan", mimo_oai.at(0).at("reasoning_content"));
+    assert_equals<size_t>(2, mimo_oai.at(0).at("tool_calls").size());
+    assert_equals<std::string>("python", mimo_oai.at(0).at("tool_calls").at(0).at("function").at("name"));
+    assert_equals<std::string>("edit", mimo_oai.at(0).at("tool_calls").at(1).at("function").at("name"));
+    assert_equals(true, json::parse(mimo_oai.at(0).at("tool_calls").at(0).at("function").at("arguments").get<std::string>()).is_object());
+    assert_equals(true, json::parse(mimo_oai.at(0).at("tool_calls").at(1).at("function").at("arguments").get<std::string>()).is_object());
+    assert_msg_equals(mimo_parallel, common_chat_msgs_parse_oaicompat(mimo_oai).at(0));
+
     auto res = common_chat_msgs_parse_oaicompat(json::parse("[{\"role\": \"assistant\", \"tool_calls\": []}]"));
     assert_equals<size_t>(1, res.size());
     assert_equals<std::string>(res[0].role, "assistant");
@@ -2194,6 +2214,31 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             .expect_tool_calls({
                 { "special_function", R"({"arg1": 1})", {} },
                 { "special_function_with_opt", R"({"arg1": 1, "arg2": 2})", {} },
+            })
+            .run();
+
+        // MiMo-V2.6 emits the same XML tool-call structure without the
+        // newlines rendered by the canonical Qwen3.5 template. Multiple
+        // tight calls must remain separate and their arguments must not
+        // contain the following call's markup.
+        tst.test(
+               "MiMo plan\n</think>\n\n"
+               "<tool_call><function=python><parameter=code>\n"
+               "Get-Content 'hello.txt' -Raw\n"
+               "</parameter></function></tool_call>"
+               "<tool_call><function=edit>"
+               "<parameter=filename>\nhello.txt\n</parameter>"
+               "<parameter=oldString>\nold\n</parameter>"
+               "<parameter=newString>\nnew\n</parameter>"
+               "</function></tool_call>")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .enable_thinking(true)
+            .parallel_tool_calls(true)
+            .tools({ python_tool, edit_tool })
+            .expect_reasoning("MiMo plan")
+            .expect_tool_calls({
+                { "python", R"({"code": "Get-Content 'hello.txt' -Raw"})", {} },
+                { "edit", R"({"filename": "hello.txt", "oldString": "old", "newString": "new"})", {} },
             })
             .run();
 
