@@ -32,6 +32,7 @@
 #include <utility>
 #include <fstream>
 #include <cstdlib>
+#include <atomic>
 #include <mutex>
 
 // fix problem with std::min and std::max
@@ -116,6 +117,157 @@ static server_trace_sink & server_trace_output() {
     static auto * sink = new server_trace_sink();
     return *sink;
 }
+
+// Live phase snapshot for /spotco/activity.
+//
+// The "──── OUTPUT ────" trace is printed when a task is launched, before
+// prompt prefill. llama_decode then runs on this thread for a long time and
+// produces no tokens, so both consoles look frozen. This snapshot is updated
+// on the inference thread and read by the HTTP thread without waiting for
+// decode to return.
+struct server_slot;
+struct server_slot_stats;
+
+enum server_activity_phase {
+    SERVER_ACTIVITY_IDLE = 0,
+    SERVER_ACTIVITY_PREPARING,
+    SERVER_ACTIVITY_PROMPT,
+    SERVER_ACTIVITY_GENERATING,
+};
+
+struct server_activity_snapshot {
+    int phase = SERVER_ACTIVITY_IDLE;
+    int task_id = -1;
+    int generation = 0;
+    int64_t phase_started_us = 0;
+    int32_t prompt_total = 0;
+    int32_t prompt_processed = 0;
+    int32_t prompt_cached = 0;
+    uint64_t n_gen = 0;
+    int64_t t_prompt_last = 0;
+    int64_t t_gen_last = 0;
+    int64_t last_token_us = 0;
+    bool trace = false;
+};
+
+static std::mutex g_server_activity_mu;
+static server_activity_snapshot g_server_activity;
+static std::atomic<int> g_server_trace_depth{ 0 };
+
+static double server_activity_tps(const server_activity_snapshot & snap) {
+    if (snap.t_prompt_last <= 0 || snap.t_gen_last <= 0 || snap.n_gen < 2) {
+        return 0.0;
+    }
+    const double steps = (double) (snap.n_gen - 1);
+    const double seconds = std::max<int64_t>(1, snap.t_gen_last - snap.t_prompt_last) / 1e6;
+    return seconds > 0.0 ? steps / seconds : 0.0;
+}
+
+static const char * server_activity_phase_name(int phase) {
+    switch (phase) {
+        case SERVER_ACTIVITY_PREPARING:  return "preparing";
+        case SERVER_ACTIVITY_PROMPT:     return "prompt";
+        case SERVER_ACTIVITY_GENERATING: return "generating";
+        default:                         return "idle";
+    }
+}
+
+static const char * server_activity_phase_label(int phase) {
+    switch (phase) {
+        case SERVER_ACTIVITY_PREPARING:  return "phase preparing";
+        case SERVER_ACTIVITY_PROMPT:     return "phase prompt processing";
+        case SERVER_ACTIVITY_GENERATING: return "phase generating";
+        default:                         return "phase idle";
+    }
+}
+
+static std::string server_activity_format_line(const server_activity_snapshot & snap) {
+    const int64_t now = ggml_time_us();
+    const double sec = snap.phase_started_us > 0 ? (double) (now - snap.phase_started_us) / 1e6 : 0.0;
+    std::string line = string_format("[llama] %s · %.1fs", server_activity_phase_label(snap.phase), std::max(0.0, sec));
+    if (snap.phase == SERVER_ACTIVITY_PROMPT && snap.prompt_total > 0) {
+        line += string_format(" · context %d/%d", snap.prompt_processed, snap.prompt_total);
+        if (snap.prompt_cached > 0) {
+            line += string_format(" · cached %d", snap.prompt_cached);
+        }
+    }
+    if (snap.phase == SERVER_ACTIVITY_GENERATING) {
+        const double tps = server_activity_tps(snap);
+        if (tps > 0.0) {
+            line += string_format(" · %.2f tok/s", tps);
+        }
+        if (snap.n_gen > 0) {
+            line += string_format(" · %llu tokens", (unsigned long long) snap.n_gen);
+        }
+    }
+    return line;
+}
+
+static void server_activity_heartbeat_tick() {
+    server_activity_snapshot snap;
+    {
+        std::lock_guard<std::mutex> lock(g_server_activity_mu);
+        snap = g_server_activity;
+    }
+    if (snap.phase == SERVER_ACTIVITY_IDLE) {
+        return;
+    }
+    if (snap.phase == SERVER_ACTIVITY_GENERATING) {
+        const int64_t now = ggml_time_us();
+        const int64_t since = snap.last_token_us > 0 ? now - snap.last_token_us : now - snap.phase_started_us;
+        // Tokens already paint the console. Only speak up when generation stalls.
+        if (since < 2 * 1000 * 1000) {
+            return;
+        }
+    }
+
+    const std::string line = server_activity_format_line(snap);
+    if (snap.trace || g_server_trace_depth.load() > 0) {
+        server_trace_output().enqueue("\n" + line + "\n");
+        return;
+    }
+    SRV_INF("%s\n", line.c_str());
+}
+
+static void server_activity_start_heartbeat() {
+    static std::once_flag once;
+    std::call_once(once, [] {
+        std::thread([] {
+            for (;;) {
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+                try {
+                    server_activity_heartbeat_tick();
+                } catch (...) {
+                    // A status line must never take down the server.
+                }
+            }
+        }).detach();
+    });
+}
+
+static json server_activity_json() {
+    server_activity_snapshot snap;
+    {
+        std::lock_guard<std::mutex> lock(g_server_activity_mu);
+        snap = g_server_activity;
+    }
+    const int64_t now = ggml_time_us();
+    const int64_t phase_us = snap.phase_started_us > 0 ? std::max<int64_t>(0, now - snap.phase_started_us) : 0;
+    return json {
+        {"phase", server_activity_phase_name(snap.phase)},
+        {"phase_ms", phase_us / 1000},
+        {"generation", snap.generation},
+        {"prompt_total", snap.prompt_total},
+        {"prompt_processed", snap.prompt_processed},
+        {"prompt_cached", snap.prompt_cached},
+        {"generated", snap.n_gen},
+        {"output_tokens_per_second", server_activity_tps(snap)},
+    };
+}
+
+static void server_activity_observe(const server_slot & slot);
+static void server_activity_mark_token();
+static void server_activity_finish(int task_id);
 
 static common_speculative_output_limits server_output_limits(const common_params & params) {
     if (params.embedding ||
@@ -472,6 +624,7 @@ struct server_slot {
         server_trace_output().flush();
 
         trace_active = true;
+        g_server_trace_depth.fetch_add(1);
     }
 
     void trace_token(const std::string & piece) {
@@ -512,6 +665,7 @@ struct server_slot {
             server_trace_output().flush();
         }
         trace_active = false;
+        g_server_trace_depth.fetch_sub(1);
     }
 
     void reset() {
@@ -694,6 +848,7 @@ struct server_slot {
         if (is_processing()) {
             GGML_ASSERT(task);
 
+            const int task_id = task->id;
             trace_finish();
 
             SLT_INF(*this, "stop processing: n_tokens = %d, truncated = %d\n", prompt.n_tokens(), truncated);
@@ -712,6 +867,7 @@ struct server_slot {
             reset();
 
             callback_on_release(id);
+            server_activity_finish(task_id);
         }
     }
 
@@ -884,6 +1040,72 @@ struct server_slot {
         other.init_sampler();
     }
 };
+
+static int server_activity_phase_of(const server_slot & slot) {
+    switch (slot.state) {
+        case SLOT_STATE_GENERATING:
+            return SERVER_ACTIVITY_GENERATING;
+        case SLOT_STATE_PROCESSING_PROMPT:
+        case SLOT_STATE_DONE_PROMPT:
+            return SERVER_ACTIVITY_PROMPT;
+        case SLOT_STATE_STARTED:
+        case SLOT_STATE_WAIT_OTHER:
+            return SERVER_ACTIVITY_PREPARING;
+        default:
+            return SERVER_ACTIVITY_IDLE;
+    }
+}
+
+static void server_activity_observe(const server_slot & slot) {
+    if (!slot.task || !slot.is_processing()) {
+        return;
+    }
+
+    const int phase = server_activity_phase_of(slot);
+    if (phase == SERVER_ACTIVITY_IDLE) {
+        return;
+    }
+
+    server_activity_start_heartbeat();
+
+    std::lock_guard<std::mutex> lock(g_server_activity_mu);
+    const bool new_task = g_server_activity.task_id != slot.task->id;
+    const bool new_phase = new_task || g_server_activity.phase != phase;
+    if (new_task) {
+        g_server_activity.generation += 1;
+        g_server_activity.last_token_us = 0;
+        g_server_activity.task_id = slot.task->id;
+    }
+    g_server_activity.phase = phase;
+    if (new_phase) {
+        g_server_activity.phase_started_us = ggml_time_us();
+    }
+    g_server_activity.prompt_total = (int32_t) slot.task->n_tokens();
+    g_server_activity.prompt_processed = (int32_t) slot.stats.n_prompt_processed;
+    g_server_activity.prompt_cached = (int32_t) slot.stats.n_prompt_cached;
+    g_server_activity.n_gen = slot.stats.n_gen;
+    g_server_activity.t_prompt_last = slot.stats.t_prompt_last;
+    g_server_activity.t_gen_last = slot.stats.t_gen_last;
+    g_server_activity.trace = g_server_trace_depth.load() > 0;
+}
+
+static void server_activity_mark_token() {
+    std::lock_guard<std::mutex> lock(g_server_activity_mu);
+    g_server_activity.last_token_us = ggml_time_us();
+}
+
+static void server_activity_finish(int task_id) {
+    std::lock_guard<std::mutex> lock(g_server_activity_mu);
+    if (g_server_activity.phase == SERVER_ACTIVITY_IDLE) {
+        return;
+    }
+    if (task_id >= 0 && g_server_activity.task_id != task_id) {
+        return;
+    }
+    g_server_activity.phase = SERVER_ACTIVITY_IDLE;
+    g_server_activity.phase_started_us = ggml_time_us();
+    g_server_activity.trace = g_server_trace_depth.load() > 0;
+}
 
 // returns 0 on success
 // caller need to update prompt.tokens after a successful call to keep track of the processing progress
@@ -2004,6 +2226,7 @@ private:
             : SLOT_STATE_STARTED;
 
         slot.trace_start();
+        server_activity_observe(slot);
 
         // reset server kill-switch counter
         n_empty_consecutive = 0;
@@ -2015,7 +2238,9 @@ private:
     bool process_token(completion_token_output & result, server_slot & slot) {
         // remember which tokens were sampled - used for repetition penalties during sampling
         const std::string token_str = result.text_to_send;
+        server_activity_mark_token();
         slot.trace_token(token_str);
+        server_activity_observe(slot);
         slot.sampled = result.tok;
 
         slot.generated_text += token_str;
@@ -3326,6 +3551,7 @@ private:
                         slot.stats.update_prompt_start();
 
                         slot.state = SLOT_STATE_PROCESSING_PROMPT;
+                        server_activity_observe(slot);
 
                         SLT_TRC(slot, "new prompt, n_ctx_slot = %d, n_keep = %d, task.n_tokens = %d\n",
                                 slot.n_ctx, slot.task->params.n_keep, slot.task->n_tokens());
@@ -3590,6 +3816,7 @@ private:
                         }
 
                         slot.stats.n_prompt_cached    = n_past;
+                        server_activity_observe(slot);
                         slot.stats.n_prompt_processed = 0;
 
                         metrics.add_prompt_cached(n_past);
@@ -3830,6 +4057,26 @@ private:
     bool decode(int32_t & n_batch, int32_t off, llama_batch & batch_view) {
         SRV_DBG("n_batch (effective) = %d, off = %d\n", n_batch, off);
 
+        // Publish before the blocking decode so clients can see this phase
+        // while llama_decode is still running.
+        {
+            const server_slot * best = nullptr;
+            int best_rank = 0;
+            for (const auto & slot : slots) {
+                if (!slot.is_processing()) {
+                    continue;
+                }
+                const int rank = server_activity_phase_of(slot);
+                if (rank > best_rank) {
+                    best_rank = rank;
+                    best = &slot;
+                }
+            }
+            if (best) {
+                server_activity_observe(*best);
+            }
+        }
+
         metrics_pre_decode();
 
         if (batch.size() == 0) {
@@ -4018,6 +4265,7 @@ private:
 
                 // prompt evaluated for next-token prediction
                 slot.state = SLOT_STATE_GENERATING;
+                server_activity_observe(slot);
 
                 if (slot.can_speculate()) {
                     common_speculative_begin(spec.get(), slot.id, slot.prompt.tokens.get_text_tokens());
@@ -4296,6 +4544,22 @@ private:
             if (t.is_prompt && slot.stats.is_set()) {
                 slot.stats.set_prompt_last(t_now);
             }
+        }
+
+        const server_slot * best = nullptr;
+        int best_rank = 0;
+        for (const auto & slot : slots) {
+            if (!slot.is_processing()) {
+                continue;
+            }
+            const int rank = server_activity_phase_of(slot);
+            if (rank > best_rank) {
+                best_rank = rank;
+                best = &slot;
+            }
+        }
+        if (best) {
+            server_activity_observe(*best);
         }
     }
 
@@ -4844,6 +5108,16 @@ void server_routes::init_routes() {
         GGML_UNUSED(ctx_server);
 
         res->ok({{"status", "ok"}});
+        return res;
+    };
+
+    // Lock-free-enough for the inference thread: reads the activity snapshot
+    // and does not enter the task queue, so it answers during llama_decode.
+    this->get_activity = [this](const server_http_req &) {
+        auto res = create_response(true);
+        bool ctx_server;
+        GGML_UNUSED(ctx_server);
+        res->ok(server_activity_json());
         return res;
     };
 

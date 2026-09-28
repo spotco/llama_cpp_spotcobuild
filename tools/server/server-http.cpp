@@ -31,6 +31,7 @@ static void log_server_request(const httplib::Request & req, const httplib::Resp
     // skip logging requests that are regularly sent, to avoid log spam
     if (req.path == "/health"
         || req.path == "/v1/health"
+        || req.path == "/spotco/activity"
         || req.path == "/models"
         || req.path == "/v1/models"
         || req.path == "/props"
